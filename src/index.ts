@@ -1,3 +1,4 @@
+import { Mutex } from 'async-mutex'
 import _debug from 'debug'
 import * as fs from 'fs'
 import globRex from 'globrex'
@@ -5,7 +6,12 @@ import { resolve } from 'path'
 import * as tsconfck from 'tsconfck'
 import type { CompilerOptions } from 'typescript'
 import { inspect } from 'util'
-import { normalizePath, Plugin, searchForWorkspaceRoot } from 'vite'
+import {
+  normalizePath,
+  Plugin,
+  ResolvedConfig,
+  searchForWorkspaceRoot,
+} from 'vite'
 import { resolvePathMappings } from './mappings'
 import { basename, dirname, isAbsolute, join, relative } from './path'
 import { PluginOptions } from './types'
@@ -25,12 +31,51 @@ type Resolver = (
 export type { PluginOptions }
 
 export default (opts: PluginOptions = {}): Plugin => {
-  let resolversByDir: Record<string, Resolver[]>
+  const parseOptions = {
+    cache: new Map(),
+    resolveWithEmptyIfConfigNotFound: true,
+  } satisfies import('tsconfck').TSConfckParseOptions
+
+  const mutex = new Mutex()
+  let resolversByDir: Record<
+    string,
+    {
+      projectPath: string
+      resolve: Resolver | null | 'error'
+    }
+  >
+  let hasTypeScriptDep: boolean
+  let config: ResolvedConfig
+  let firstError: any
+
+  const loadProject = (tsconfigFile: string) =>
+    (hasTypeScriptDep
+      ? tsconfck.parseNative(tsconfigFile, parseOptions)
+      : tsconfck.parse(tsconfigFile, parseOptions)
+    ).catch((error) => {
+      if (!opts.ignoreConfigErrors) {
+        config.logger.error(
+          '[tsconfig-paths] An error occurred while parsing "' +
+            tsconfigFile +
+            '". See below for details.' +
+            (firstError
+              ? ''
+              : ' To disable this message, set the `ignoreConfigErrors` option to true.'),
+          { error }
+        )
+        if (config.logger.hasErrorLogged(error)) {
+          console.error(error)
+        }
+        firstError = error
+      }
+      return null
+    })
 
   return {
     name: 'vite-tsconfig-paths',
     enforce: 'pre',
-    async configResolved(config) {
+    async configResolved(resolvedConfig) {
+      config = resolvedConfig
       let projectRoot = config.root
       let workspaceRoot!: string
 
@@ -59,7 +104,7 @@ export default (opts: PluginOptions = {}): Plugin => {
 
       debug('projects:', projects)
 
-      let hasTypeScriptDep = false
+      hasTypeScriptDep = false
       if (opts.parseNative) {
         try {
           const pkgJson = fs.readFileSync(
@@ -76,77 +121,13 @@ export default (opts: PluginOptions = {}): Plugin => {
         }
       }
 
-      let firstError: any
-
-      const parseOptions = {
-        resolveWithEmptyIfConfigNotFound: true,
-      } satisfies import('tsconfck').TSConfckParseOptions
-
-      const parsedProjects = new Set(
-        (
-          await Promise.all(
-            projects.map((tsconfigFile) =>
-              (hasTypeScriptDep
-                ? tsconfck.parseNative(tsconfigFile, parseOptions)
-                : tsconfck.parse(tsconfigFile, parseOptions)
-              ).catch((error) => {
-                if (!opts.ignoreConfigErrors) {
-                  config.logger.error(
-                    '[tsconfig-paths] An error occurred while parsing "' +
-                      tsconfigFile +
-                      '". See below for details.' +
-                      (firstError
-                        ? ''
-                        : ' To disable this message, set the `ignoreConfigErrors` option to true.'),
-                    { error }
-                  )
-                  if (config.logger.hasErrorLogged(error)) {
-                    console.error(error)
-                  }
-                  firstError = error
-                }
-                return null
-              })
-            )
-          )
-        ).filter((project, i) => {
-          if (!project) {
-            return false
-          }
-          if (project.tsconfigFile !== 'no_tsconfig_file_found') {
-            return true
-          }
-          debug('tsconfig file not found:', projects[i])
-          return false
-        })
-      )
-
       resolversByDir = {}
-      parsedProjects.forEach((project) => {
-        if (!project) {
-          return
+      for (const project of projects) {
+        resolversByDir[normalizePath(dirname(project))] = {
+          projectPath: project,
+          resolve: null,
         }
-        // Don't create a resolver for projects with a references array.
-        // Instead, create a resolver for each project in that array.
-        if (project.referenced) {
-          project.referenced.forEach((projectRef) => {
-            parsedProjects.add(projectRef)
-          })
-          // Reinsert the parent project so it's tried last. This is
-          // important because project references can be used to
-          // override the parent project.
-          parsedProjects.delete(project)
-          parsedProjects.add(project)
-          project.referenced = undefined
-        } else {
-          const resolver = createResolver(project)
-          if (resolver) {
-            const projectDir = normalizePath(dirname(project.tsconfigFile))
-            const resolvers = (resolversByDir[projectDir] ||= [])
-            resolvers.push(resolver)
-          }
-        }
-      })
+      }
     },
     async resolveId(id, importer) {
       if (importer && !relativeImportRE.test(id) && !isAbsolute(id)) {
@@ -159,9 +140,22 @@ export default (opts: PluginOptions = {}): Plugin => {
         // Find the nearest directory with a matching tsconfig file.
         loop: while (projectDir && projectDir != prevProjectDir) {
           const resolvers = resolversByDir[projectDir]
-          if (resolvers)
-            for (const resolve of resolvers) {
-              const [resolved, matched] = await resolve(
+          if (resolvers) {
+            if (!resolvers.resolve) {
+              await mutex.runExclusive(async () => {
+                // Note: we need to check again once mutex is acquired.
+                if (!resolvers.resolve) {
+                  const parsedProject = await loadProject(resolvers.projectPath)
+                  if (parsedProject) {
+                    resolvers.resolve = createResolver(parsedProject) || 'error'
+                  } else {
+                    resolvers.resolve = 'error'
+                  }
+                }
+              })
+            }
+            if (typeof resolvers.resolve === 'function') {
+              const [resolved, matched] = await resolvers.resolve(
                 viteResolve,
                 id,
                 importer
@@ -174,6 +168,7 @@ export default (opts: PluginOptions = {}): Plugin => {
                 break loop
               }
             }
+          }
           prevProjectDir = projectDir
           projectDir = dirname(prevProjectDir)
         }
